@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""redisq - read-only Redis commands by named profile, optionally through a SOCKS5 proxy.
+
+Usage:
+  redisq --profile uat GET user:42
+  redisq --profile uat "HGETALL session:abc"
+  redisq --profile uat --scan "user:*"
+  printf 'GET a\\nTTL a\\n' | redisq --profile uat
+
+Profiles live in ~/.redisq/credentials (override with REDISQ_CREDENTIALS), INI format:
+
+  [uat]
+  host = example.cache.amazonaws.com
+  port = 6379
+  user = reader                 ; optional ACL user
+  password = secret             ; optional
+  db = 0                        ; optional database number
+  tls = false                   ; optional; true connects over TLS
+  socks_proxy = 127.0.0.1:1081  ; optional SOCKS5 proxy (no auth)
+  allow_write = false           ; optional; true lifts the read-only guard for this profile
+
+The credentials file must be owned by you and not readable by anyone else (chmod 600).
+
+No redis-cli needed: redisq speaks the Redis protocol itself, so the command it checks is exactly the command it sends.
+Only read commands are accepted unless the profile sets allow_write = true. KEYS is refused (it blocks the server on
+large databases); use --scan instead, which returns at most --max-rows keys (default 1000). redisq gives up on a
+reply after --timeout seconds (default 30); pass 0 to lift either limit.
+"""
+import argparse
+import configparser
+import json
+import os
+import shlex
+import socket
+import ssl
+import struct
+import sys
+
+DEFAULT_CREDENTIALS = os.path.expanduser("~/.redisq/credentials")
+CONNECT_TIMEOUT = 15
+
+# --- read-only guard -------------------------------------------------------------------------------------------------
+
+READ_COMMANDS = {
+    # strings and bitmaps
+    "GET", "MGET", "STRLEN", "GETRANGE", "SUBSTR", "LCS", "GETBIT", "BITCOUNT", "BITPOS", "BITFIELD_RO",
+    # keyspace
+    "EXISTS", "TYPE", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", "SCAN", "RANDOMKEY", "DBSIZE", "DUMP", "SORT_RO",
+    # hashes
+    "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS", "HSTRLEN", "HRANDFIELD", "HSCAN",
+    "HTTL", "HPTTL", "HEXPIRETIME", "HPEXPIRETIME",
+    # lists
+    "LRANGE", "LLEN", "LINDEX", "LPOS",
+    # sets
+    "SMEMBERS", "SISMEMBER", "SMISMEMBER", "SCARD", "SRANDMEMBER", "SINTER", "SINTERCARD", "SUNION", "SDIFF",
+    "SSCAN",
+    # sorted sets
+    "ZRANGE", "ZRANGEBYSCORE", "ZREVRANGE", "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZSCORE",
+    "ZMSCORE", "ZRANK", "ZREVRANK", "ZCARD", "ZCOUNT", "ZLEXCOUNT", "ZRANDMEMBER", "ZINTER", "ZINTERCARD",
+    "ZUNION", "ZDIFF", "ZSCAN",
+    # streams, hyperloglogs, geo
+    "XRANGE", "XREVRANGE", "XLEN", "XREAD", "XPENDING", "PFCOUNT",
+    "GEOPOS", "GEODIST", "GEOHASH", "GEOSEARCH", "GEORADIUS_RO", "GEORADIUSBYMEMBER_RO",
+    # server
+    "PING", "ECHO", "INFO", "TIME", "LASTSAVE", "ROLE", "SELECT",
+}
+
+# Container commands where only some subcommands are reads (CONFIG GET yes, CONFIG SET no)
+READ_SUBCOMMANDS = {
+    "OBJECT": {"ENCODING", "FREQ", "IDLETIME", "REFCOUNT", "HELP"},
+    "MEMORY": {"USAGE", "STATS", "DOCTOR", "HELP"},
+    "XINFO": {"STREAM", "GROUPS", "CONSUMERS", "HELP"},
+    "CONFIG": {"GET"},
+    "CLIENT": {"LIST", "INFO", "GETNAME", "ID"},
+    "CLUSTER": {"INFO", "NODES", "SLOTS", "SHARDS", "KEYSLOT", "COUNTKEYSINSLOT", "MYID"},
+    "COMMAND": {"COUNT", "INFO", "DOCS", "LIST", "GETKEYS"},
+    "SLOWLOG": {"GET", "LEN"},
+    "LATENCY": {"LATEST", "HISTORY", "DOCTOR"},
+}
+
+
+def check_read_only(commands):
+    """Raise ValueError unless every command is a read."""
+    if not commands:
+        raise ValueError("no command given")
+    for argv in commands:
+        name = argv[0].upper()
+        if name in READ_SUBCOMMANDS:
+            sub = argv[1].upper() if len(argv) > 1 else ""
+            if sub not in READ_SUBCOMMANDS[name]:
+                allowed = ", ".join(sorted(READ_SUBCOMMANDS[name]))
+                raise ValueError(f"{name} {sub or '(no subcommand)'} is not allowed; {name} allows only {allowed}")
+        elif name == "KEYS":
+            raise ValueError("KEYS blocks the server on large databases; use --scan PATTERN instead")
+        elif name not in READ_COMMANDS:
+            raise ValueError(f"{name} is not a read command")
+
+
+def parse_commands(text):
+    """One command per line with shell-style quoting. Blank lines and lines starting with # are skipped."""
+    commands = []
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            commands.append(shlex.split(line))
+        except ValueError as ex:
+            raise ValueError(f"line {number}: {ex}") from None
+    return commands
+
+
+# --- Redis protocol --------------------------------------------------------------------------------------------------
+
+class Status(str):
+    """A simple-string reply such as OK or PONG, printed without quotes."""
+
+
+class ReplyError(Exception):
+    """An error reply from the server. Returned as a value, not raised, so the remaining commands still run."""
+
+
+def encode_command(argv):
+    parts = [b"*%d\r\n" % len(argv)]
+    for arg in argv:
+        data = arg if isinstance(arg, bytes) else arg.encode("utf-8", "surrogateescape")
+        parts.append(b"$%d\r\n%s\r\n" % (len(data), data))
+    return b"".join(parts)
+
+
+def read_reply(f):
+    line = f.readline()
+    if not line.endswith(b"\r\n"):
+        raise ConnectionError("connection closed by server")
+    kind, rest = line[:1], line[1:-2]
+    if kind == b"+":
+        return Status(rest.decode("utf-8", "replace"))
+    if kind in (b"-", b"!"):  # RESP3 blob errors (!) carry a length first
+        msg = read_blob(f, int(rest)) if kind == b"!" else rest
+        return ReplyError(msg.decode("utf-8", "replace"))
+    if kind in (b":", b"("):
+        return int(rest)
+    if kind in (b"$", b"="):
+        if int(rest) < 0:
+            return None
+        data = read_blob(f, int(rest))
+        return data[4:] if kind == b"=" else data  # verbatim strings start with a "txt:" format tag
+    if kind in (b"*", b"~", b">"):
+        return None if int(rest) < 0 else [read_reply(f) for _ in range(int(rest))]
+    if kind == b"%":
+        return [read_reply(f) for _ in range(2 * int(rest))]  # maps print as flat key/value lists, like RESP2
+    # The rest are RESP3-only, seen only after a HELLO 3 on a write-enabled profile
+    if kind == b"_":
+        return None
+    if kind == b"#":
+        return int(rest == b"t")
+    if kind == b",":
+        return Status(rest.decode())
+    if kind == b"|":
+        for _ in range(2 * int(rest)):
+            read_reply(f)  # attributes are out-of-band metadata
+        return read_reply(f)
+    raise ConnectionError(f"unexpected reply from server: {line[:80]!r}")
+
+
+def read_blob(f, n):
+    data = f.read(n + 2)
+    if len(data) < n + 2:
+        raise ConnectionError("connection closed by server")
+    return data[:-2]
+
+
+class Connection:
+    def __init__(self, sock):
+        self.sock = sock
+        self.reader = sock.makefile("rb")
+
+    def call(self, argv):
+        self.sock.sendall(encode_command(argv))
+        return read_reply(self.reader)
+
+    def close(self):
+        self.reader.close()
+        self.sock.close()
+
+
+# --- SOCKS5 ----------------------------------------------------------------------------------------------------------
+
+def socks5_connect(proxy, target_host, target_port):
+    sock = socket.create_connection(proxy, timeout=CONNECT_TIMEOUT)
+    try:
+        sock.sendall(b"\x05\x01\x00")  # SOCKS5, one auth method: none
+        if recv_exact(sock, 2) != b"\x05\x00":
+            raise ConnectionError("SOCKS proxy refused no-auth handshake")
+        host = target_host.encode()
+        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack(">H", target_port))
+        reply = recv_exact(sock, 4)
+        if reply[1] != 0:
+            raise ConnectionError(f"SOCKS proxy failed to connect to {target_host}:{target_port} (code {reply[1]})")
+        addr_len = {1: 4, 4: 16}.get(reply[3]) or recv_exact(sock, 1)[0]
+        recv_exact(sock, addr_len + 2)  # bound address + port, unused
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+def recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("SOCKS proxy closed the connection")
+        data += chunk
+    return data
+
+
+# --- output ----------------------------------------------------------------------------------------------------------
+
+ESCAPES = {ord("\\"): "\\\\", ord('"'): '\\"', ord("\n"): "\\n", ord("\r"): "\\r", ord("\t"): "\\t",
+           ord("\a"): "\\a", ord("\b"): "\\b"}
+
+
+def quote(data):
+    """Quote a bulk string the way redis-cli does: printable ASCII as is, everything else escaped."""
+    out = []
+    for byte in data:
+        if byte in ESCAPES:
+            out.append(ESCAPES[byte])
+        elif 0x20 <= byte < 0x7f:
+            out.append(chr(byte))
+        else:
+            out.append(f"\\x{byte:02x}")
+    return '"' + "".join(out) + '"'
+
+
+def format_human(reply):
+    if isinstance(reply, ReplyError):
+        return f"(error) {reply}"
+    if reply is None:
+        return "(nil)"
+    if isinstance(reply, Status):
+        return str(reply)
+    if isinstance(reply, int):
+        return f"(integer) {reply}"
+    if isinstance(reply, bytes):
+        return quote(reply)
+    if not reply:
+        return "(empty array)"
+    width = len(str(len(reply)))
+    lines = []
+    for i, item in enumerate(reply, 1):
+        label = f"{i:>{width}}) "
+        first, *rest = format_human(item).split("\n")
+        lines.append(label + first)
+        lines.extend(" " * len(label) + line for line in rest)
+    return "\n".join(lines)
+
+
+def format_raw(reply):
+    if isinstance(reply, list):
+        return b"\n".join(format_raw(item) for item in reply)
+    if isinstance(reply, ReplyError):
+        return f"(error) {reply}".encode()
+    if reply is None:
+        return b""
+    if isinstance(reply, bytes):
+        return reply
+    return str(reply).encode()
+
+
+def to_json(reply):
+    if isinstance(reply, list):
+        return [to_json(item) for item in reply]
+    if isinstance(reply, ReplyError):
+        return {"error": str(reply)}
+    if isinstance(reply, bytes):
+        return reply.decode("utf-8", "backslashreplace")
+    return reply
+
+
+def write_reply(reply, mode):
+    if mode == "json":
+        data = json.dumps(to_json(reply), ensure_ascii=False).encode()
+    elif mode == "raw":
+        data = format_raw(reply)
+    else:
+        data = format_human(reply).encode()
+    sys.stdout.buffer.write(data + b"\n")
+    sys.stdout.buffer.flush()
+
+
+# --- main ------------------------------------------------------------------------------------------------------------
+
+def load_profile(name):
+    path = os.environ.get("REDISQ_CREDENTIALS", DEFAULT_CREDENTIALS)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        sys.exit(f"redisq: credentials file not found: {path}")
+    # Like ssh with private keys: refuse a file that someone else owns or can read
+    if st.st_uid != os.getuid():
+        sys.exit(f"redisq: {path} is not owned by you")
+    if st.st_mode & 0o077:
+        sys.exit(f"redisq: {path} is accessible by other users (mode {st.st_mode & 0o777:o}); "
+                 f"run: chmod 600 {path}")
+    config = configparser.ConfigParser(inline_comment_prefixes=(";",), interpolation=None)
+    config.read(path)
+    if name not in config:
+        sys.exit(f"redisq: profile '{name}' not found in {path}")
+    profile = config[name]
+    if not profile.get("host"):
+        sys.exit(f"redisq: profile '{name}' is missing host")
+    if profile.get("user") and not profile.get("password"):
+        sys.exit(f"redisq: profile '{name}' sets user but no password")
+    return profile
+
+
+def get_option(profile, name, key, getter, default, kind):
+    try:
+        return getter(key, default)
+    except ValueError:
+        sys.exit(f"redisq: profile '{name}': {key} must be {kind}")
+
+
+def parse_host_port(value):
+    host, _, port = value.rpartition(":")
+    return host, int(port)
+
+
+def connect(profile, timeout):
+    host, port = profile["host"], profile.getint("port", 6379)
+    if profile.get("socks_proxy"):
+        sock = socks5_connect(parse_host_port(profile["socks_proxy"]), host, port)
+    else:
+        sock = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+    sock.settimeout(timeout or None)
+    if profile.getboolean("tls", False):
+        context = ssl.create_default_context(cafile=profile.get("tls_ca") or None)
+        sock = context.wrap_socket(sock, server_hostname=host)  # verify against the real host, even via the proxy
+    return Connection(sock)
+
+
+def scan(conn, pattern, max_keys, mode):
+    """Print keys matching pattern using SCAN, which never blocks the server the way KEYS does."""
+    seen, cursor = set(), b"0"
+    while True:
+        reply = conn.call(["SCAN", cursor, "MATCH", pattern, "COUNT", "1000"])
+        if isinstance(reply, ReplyError):
+            sys.exit(f"redisq: SCAN failed: {reply}")
+        cursor, keys = reply
+        for key in keys:
+            if key in seen:
+                continue  # SCAN may return a key more than once
+            if max_keys and len(seen) == max_keys:
+                print(f"redisq: stopped after {max_keys} keys; raise --max-rows to see more", file=sys.stderr)
+                return
+            seen.add(key)
+            line = json.dumps(to_json(key), ensure_ascii=False).encode() if mode == "json" else key
+            sys.stdout.buffer.write(line + b"\n")
+        if cursor == b"0":
+            return
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="redisq", description="Read-only Redis commands by profile.")
+    parser.add_argument("--profile", "-p", default=os.environ.get("REDISQ_PROFILE"), help="profile name")
+    parser.add_argument("--db", "-n", type=int, help="database number (default: the profile's db, else 0)")
+    parser.add_argument("--scan", metavar="PATTERN", help="list keys matching PATTERN (use '*' for all) via SCAN")
+    parser.add_argument("--max-rows", type=int, default=1000, metavar="N",
+                        help="with --scan, stop after N keys (default: %(default)s, 0 = no limit)")
+    parser.add_argument("--timeout", type=int, default=30, metavar="SECONDS",
+                        help="give up waiting for a reply after this long (default: %(default)s, 0 = no limit)")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--raw", action="store_true", help="print values bare, one per line")
+    output.add_argument("--json", action="store_true", help="print each reply as a line of JSON")
+    parser.add_argument("command", nargs=argparse.REMAINDER,
+                        help="command and arguments; a single argument is split shell-style. "
+                             "Read from stdin, one command per line, when omitted")
+    args = parser.parse_args()
+    mode = "json" if args.json else "raw" if args.raw else "human"
+
+    if not args.profile:
+        parser.error("--profile is required (or set REDISQ_PROFILE)")
+    if args.max_rows < 0 or args.timeout < 0:
+        parser.error("--max-rows and --timeout must be 0 or more")
+    if args.scan is not None and args.command:
+        parser.error("--scan takes no command")
+
+    commands = []
+    if args.scan is None:
+        try:
+            if len(args.command) == 1:
+                commands = parse_commands(args.command[0])
+            elif args.command:
+                commands = [args.command]
+            elif sys.stdin.isatty():
+                parser.error("no command given: pass it as arguments or pipe it on stdin")
+            else:
+                commands = parse_commands(sys.stdin.read())
+        except ValueError as ex:
+            sys.exit(f"redisq: {ex}")
+        if not commands:
+            sys.exit("redisq: no command given")
+
+    profile = load_profile(args.profile)
+    allow_write = get_option(profile, args.profile, "allow_write", profile.getboolean, False, "true or false")
+    get_option(profile, args.profile, "tls", profile.getboolean, False, "true or false")
+    get_option(profile, args.profile, "port", profile.getint, 6379, "a number")
+    db = args.db if args.db is not None else get_option(profile, args.profile, "db", profile.getint, 0, "a number")
+    # --scan only sends SCAN, so there is nothing to check for it. AUTH and HELLO are refused too: they could switch
+    # the session to an ACL user with write access.
+    if not allow_write and args.scan is None:
+        try:
+            check_read_only(commands)
+        except ValueError as ex:
+            sys.exit(f"redisq: rejected: {ex}")
+
+    try:
+        conn = connect(profile, args.timeout)
+    except (OSError, ValueError) as ex:
+        sys.exit(f"redisq: cannot connect: {ex}")
+    try:
+        # Credentials go over the connection, so they never appear on a command line where `ps` shows them
+        if profile.get("password"):
+            auth = ["AUTH", *([profile["user"]] if profile.get("user") else []), profile["password"]]
+            reply = conn.call(auth)
+            if isinstance(reply, ReplyError):
+                sys.exit(f"redisq: authentication failed: {reply}")
+        if db:
+            reply = conn.call(["SELECT", str(db)])
+            if isinstance(reply, ReplyError):
+                sys.exit(f"redisq: SELECT {db} failed: {reply}")
+
+        if args.scan is not None:
+            scan(conn, args.scan, args.max_rows, mode)
+            return 0
+        status = 0
+        for argv in commands:
+            reply = conn.call(argv)
+            write_reply(reply, mode)
+            if isinstance(reply, ReplyError):
+                status = 1
+        return status
+    except socket.timeout:
+        sys.exit(f"redisq: no reply after {args.timeout} seconds")
+    except OSError as ex:
+        sys.exit(f"redisq: {ex}")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
